@@ -52,6 +52,13 @@
   #pin { text-align:center; font-size:26px; letter-spacing:.3em; }
   .hide { display:none !important; }
   .two { display:flex; gap:10px; } .two > div { flex:1; }
+  .tabs button { font-size:14px; position:relative; }
+  .tabs button small { font-weight:500; opacity:.7; }
+  .tabs button.on { background:var(--ink); color:#fff; border-color:var(--ink); }
+  .tabs .dot { position:absolute; top:6px; right:8px; width:8px; height:8px; border-radius:50%; background:var(--out); }
+  .btn.in { background:var(--in); } .btn.out { background:var(--out); } .btn.adj { background:var(--adj); }
+  .seg button.on[data-t=SCARICO] { background:var(--out); color:#fff; border-color:var(--out); }
+  .newbox { border-left:3px solid var(--in); padding-left:10px; margin-top:4px; }
 </style>
 </head>
 <body>
@@ -79,10 +86,10 @@
   <header><h1>Inventario</h1><div><span id="who" style="font-size:13px;margin-right:8px"></span><button id="btnOut">Esci</button></div></header>
   <main id="main"></main>
   <nav>
-    <button data-v="mov">Movimento</button>
+    <button data-v="in">Entrate</button>
+    <button data-v="out">Uscite</button>
     <button data-v="stock">Giacenze</button>
     <button data-v="log">Registro</button>
-    <button data-v="art">Articoli</button>
   </nav>
 </div>
 <div id="toast"></div>
@@ -99,7 +106,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&
 const fmt = n => Number(n).toLocaleString("it-IT", { maximumFractionDigits: 2 });
 const TKEY = "inv_token";
 let S = { user:"", articles:[], movements:[], totalMovements:0 };
-let view = "mov", movTipo = "CARICO", movArt = "", editId = null, busy = false;
+let view = "in", movTipo = "CARICO", movArt = "", editId = null, busy = false;
 let filt = { art:"", tipo:"" }, stockQ = "";
 
 const store = {
@@ -153,76 +160,175 @@ $("pin").addEventListener("keydown", e => { if (e.key === "Enter") $("btnLogin")
 $("btnOut").onclick = async () => { try { await api("logout"); } catch (e) {} token = ""; store.set(""); showLogin(); };
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => { view = b.dataset.v; editId = null; render(); });
 
+const UNITS = ["bt", "fusti", "scatole", "pz", "kg", "L"];
+const UNIT_LABEL = { bt:"Bottiglie / lattine (bt)", fusti:"Fusti", scatole:"Scatole / cartoni", pz:"Pezzi (pz)", kg:"Chili (kg)", L:"Litri (L)" };
+const norm = t => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const artKey = (nome, formato) => norm(nome) + "|" + norm(formato).replace(/^(bottiglia|bott|bt)/, "");
+const BEER_FORMATS = ["Bottiglia 33 cl", "Bottiglia 50 cl", "Bottiglia 75 cl", "Lattina 33 cl", "Lattina 44 cl", "Fusto 20 L", "Fusto 24 L", "Fusto 30 L"];
+const tidy = t => { t = String(t || "").replace(/\s+/g, " ").trim(); return t ? t[0].toUpperCase() + t.slice(1) : ""; };
 const label = a => a.nome + (a.formato ? " - " + a.formato : "");
 const active = () => S.articles.filter(a => a.attivo);
-const byCat = list => ["Birre", "Materiali"].map(c => [c, list.filter(a => a.categoria === c).sort((x, y) => label(x).localeCompare(label(y), "it"))]).filter(g => g[1].length);
+const GROUPS = ["Materiali", "Bottiglie", "Fusti"];
+const groupOf = a => a.categoria !== "Birre" ? "Materiali" : (/^fust/i.test(a.formato || "") || a.unita === "fusti") ? "Fusti" : "Bottiglie";
+const isLowA = a => a.soglia > 0 && a.giacenza <= a.soglia;
+const sortL = l => l.slice().sort((x, y) => label(x).localeCompare(label(y), "it"));
+const byCat = list => GROUPS.map(g => [g, sortL(list.filter(a => groupOf(a) === g))]).filter(g => g[1].length);
 const artOptions = (list, sel, withStock) => byCat(list).map(([c, as]) =>
   `<optgroup label="${esc(c)}">` + as.map(a => `<option value="${esc(a.id)}"${a.id === sel ? " selected" : ""}>${esc(label(a))}${withStock ? " (" + fmt(a.giacenza) + " " + esc(a.unita) + ")" : ""}</option>`).join("") + "</optgroup>").join("");
+const groupTabs = (cur, extra) => `<div class="seg tabs">${GROUPS.map(g => `<button data-g="${g}" class="${g === cur ? "on" : ""}">${g}${extra ? extra(g) : ""}</button>`).join("")}</div>`;
+const num = v => Number(String(v || "").replace(",", ".").trim());
+const FORMATS_OF = { Bottiglie: BEER_FORMATS.filter(f => !/^fusto/i.test(f)), Fusti: BEER_FORMATS.filter(f => /^fusto/i.test(f)) };
+const lotsOn = () => !!S.lotti;   // i lotti si attivano quando lo script li supporta
+const hasLot = a => !!a && a.categoria === "Birre" && lotsOn();
+const normLot = t => String(t || "").toUpperCase().replace(/\s+/g, "");
+const lotsOf = a => { const l = a && a.lotti; return Array.isArray(l) ? l : Object.entries(l || {}); };
+const lotsTxt = a => lotsOf(a).map(([l, q]) => l + ": " + fmt(q)).join("; ");
+const lotList = a => `<datalist id="lotsOf${esc(a.id)}">${lotsOf(a).map(([l]) => `<option value="${esc(l)}">`).join("")}</datalist>`;
+let inGroup = "Bottiglie", inArt = "", outTipo = "SCARICO", outLot = "", outArt = "", outGroup = "Bottiglie", stockTab = "Materiali", backView = "stock";
 
 function render() {
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.v === view));
-  ({ mov: vMov, stock: vStock, log: vLog, art: vArt })[view]();
+  ({ in: vIn, out: vOut, stock: vStock, log: vLog, art: vArt })[view]();
   window.scrollTo(0, 0);
 }
 
-/* ---------- MOVIMENTO ---------- */
-function vMov() {
-  const list = active();
-  if (!list.length) { $("main").innerHTML = `<div class="center">Nessun articolo.<br>Aggiungine uno dalla scheda <b>Articoli</b>.</div>`; return; }
+/* ---------- ENTRATE ---------- */
+function vIn() {
+  const list = sortL(active().filter(a => groupOf(a) === inGroup));
+  const isNew = inArt === "__new" || !list.length;
+  const names = [...new Set(S.articles.filter(a => groupOf(a) === inGroup).map(a => a.nome))].sort((x, y) => x.localeCompare(y, "it"));
   $("main").innerHTML = `
   <div class="card">
-    <div class="seg">${["CARICO", "SCARICO", "RETTIFICA"].map(t => `<button data-t="${t}" class="${t === movTipo ? "on" : ""}">${t[0] + t.slice(1).toLowerCase()}</button>`).join("")}</div>
-    <label for="mArt">Articolo</label>
-    <select id="mArt"><option value="">Scegli…</option>${artOptions(list, movArt, true)}</select>
-    <label for="mQty">Quantità</label>
-    <input id="mQty" type="text" inputmode="${movTipo === "RETTIFICA" ? "text" : "decimal"}" autocomplete="off" placeholder="${movTipo === "RETTIFICA" ? "es. -3 oppure 5" : "0"}">
-    ${movTipo === "RETTIFICA" ? `<div class="hint">Serve a correggere un errore o una rottura: numero negativo per togliere, positivo per aggiungere.</div>` : ""}
-    <label for="mNota">Nota ${movTipo === "RETTIFICA" ? "(obbligatoria)" : "(facoltativa)"}</label>
-    <input id="mNota" type="text" maxlength="200" autocomplete="off" placeholder="es. cliente, lotto, motivo">
-    <button class="btn" id="mSave">Registra ${movTipo.toLowerCase()}</button>
+    ${groupTabs(inGroup)}
+    <label for="iArt">Articolo</label>
+    <select id="iArt">${list.length ? `<option value="">Scegli…</option>` : ""}${list.map(a => `<option value="${esc(a.id)}"${a.id === inArt ? " selected" : ""}>${esc(label(a))} (${fmt(a.giacenza)} ${esc(a.unita)})</option>`).join("")}<option value="__new"${isNew ? " selected" : ""}>+ Nuovo articolo…</option></select>
+    ${isNew ? `<div class="newbox">
+      <label for="iNome">Nome</label>
+      <input id="iNome" list="iNomi" maxlength="60" autocomplete="off" placeholder="${inGroup === "Materiali" ? "es. Scatola 12x33 cl, Tappi corona" : "es. Alpa"}">
+      <datalist id="iNomi">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>
+      ${inGroup === "Materiali" ? `
+      <label for="iUni">Si conta in</label>
+      <select id="iUni">${["pz", "scatole", "kg", "L"].map(u => `<option value="${u}">${UNIT_LABEL[u]}</option>`).join("")}</select>` : `
+      <label for="iFor">Formato</label>
+      <select id="iFor"><option value="">Scegli…</option>${FORMATS_OF[inGroup].map(f => `<option>${esc(f)}</option>`).join("")}</select>`}
+      <div class="hint">Se l'articolo esiste già, la quantità viene aggiunta a quello: non si creano doppioni.</div>
+    </div>` : ""}
+    ${inGroup !== "Materiali" && lotsOn() ? (() => { const cur = list.find(a => a.id === inArt); return `
+    <label for="iLot">Lotto</label>
+    <input id="iLot" ${cur ? `list="lotsOf${esc(cur.id)}"` : ""} maxlength="20" autocomplete="off" autocapitalize="characters" placeholder="es. L2611">
+    ${cur ? lotList(cur) + (lotsOf(cur).length ? `<div class="hint">Lotti già in magazzino: ${esc(lotsTxt(cur))}</div>` : "") : ""}`; })() : ""}
+    <label for="iQty">Quantità in entrata</label>
+    <input id="iQty" type="text" inputmode="decimal" autocomplete="off" placeholder="0">
+    <label for="iNota">Nota (facoltativa)</label>
+    <input id="iNota" type="text" maxlength="200" autocomplete="off" placeholder="es. fornitore, cotta">
+    <button class="btn in" id="iSave">Registra entrata</button>
   </div>
-  <h2>Ultimi movimenti</h2><div class="card">${movRows(S.movements.slice(0, 5)) || '<div class="s">Ancora nessun movimento.</div>'}</div>`;
-  document.querySelectorAll(".seg button").forEach(b => b.onclick = () => { movArt = $("mArt").value; movTipo = b.dataset.t; vMov(); });
-  $("mArt").onchange = e => movArt = e.target.value;
-  $("mSave").onclick = () => run(async () => {
-    const articoloId = $("mArt").value, q = Number($("mQty").value.replace(",", ".").trim()), nota = $("mNota").value.trim();
-    if (!articoloId) throw new Error("Scegli l'articolo.");
-    if (!isFinite(q) || q === 0 || (movTipo !== "RETTIFICA" && q < 0)) throw new Error("Quantità non valida.");
-    if (movTipo === "RETTIFICA" && !nota) throw new Error("Scrivi il motivo nella nota.");
-    S = await api("move", { tipo: movTipo, articoloId, quantita: q, nota });
-    movArt = articoloId; toast("Registrato"); vMov();
+  <h2>Ultime entrate</h2><div class="card">${movRows(S.movements.filter(m => m.tipo === "CARICO").slice(0, 5)) || '<div class="s">Ancora nessuna entrata.</div>'}</div>`;
+  document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { inGroup = b.dataset.g; inArt = ""; vIn(); });
+  $("iArt").onchange = e => { inArt = e.target.value; vIn(); };
+  $("iSave").onclick = () => run(async () => {
+    const q = num($("iQty").value), nota = $("iNota").value.trim(), lotto = $("iLot") ? normLot($("iLot").value) : "";
+    let id = isNew ? "" : $("iArt").value, msg = "Entrata registrata";
+    if ($("iLot") && !lotto) throw new Error("Scrivi il lotto.");
+    if (!isNew && !id) throw new Error("Scegli l'articolo.");
+    if (isNew) {
+      const nome = tidy($("iNome").value), formato = inGroup === "Materiali" ? "" : $("iFor").value;
+      if (!nome) throw new Error("Scrivi il nome.");
+      if (inGroup !== "Materiali" && !formato) throw new Error("Scegli il formato.");
+      if (!isFinite(q) || q <= 0) throw new Error("Quantità non valida.");
+      const ex = S.articles.find(x => artKey(x.nome, x.formato) === artKey(nome, formato));
+      if (ex) {
+        id = ex.id; msg = "Già presente: aggiunto a " + label(ex);
+        if (!ex.attivo) S = await api("saveArticle", { article: { id: ex.id, categoria: ex.categoria, nome: ex.nome, formato: ex.formato, unita: ex.unita, soglia: ex.soglia, attivo: true } });
+      } else {
+        const before = new Set(S.articles.map(x => x.id));
+        S = await api("saveArticle", { article: { id: "", categoria: inGroup === "Materiali" ? "Materiali" : "Birre", nome, formato,
+          unita: inGroup === "Materiali" ? $("iUni").value : inGroup === "Fusti" ? "fusti" : "bt", soglia: 0, attivo: true } });
+        id = (S.articles.find(x => !before.has(x.id)) || {}).id; msg = "Nuovo articolo creato";
+      }
+    }
+    if (!isFinite(q) || q <= 0) throw new Error("Quantità non valida.");
+    S = await api("move", { tipo: "CARICO", articoloId: id, quantita: q, nota, lotto });
+    inArt = id; toast(msg + (lotto ? " · lotto " + lotto : "")); vIn();
+  });
+}
+
+/* ---------- USCITE ---------- */
+function vOut() {
+  const list = sortL(active().filter(a => groupOf(a) === outGroup));
+  const sel = list.find(a => a.id === outArt);
+  $("main").innerHTML = `
+  <div class="card">
+    ${groupTabs(outGroup)}
+    <div class="seg kind" style="margin-top:10px">${[["SCARICO", "Uscita"], ["RETTIFICA", "Correzione"]].map(([t, l]) => `<button data-t="${t}" class="${t === outTipo ? "on" : ""}">${l}</button>`).join("")}</div>
+    <label for="oArt">Articolo</label>
+    <select id="oArt">${list.length ? `<option value="">Scegli…</option>` + list.map(a => `<option value="${esc(a.id)}"${a.id === outArt ? " selected" : ""}>${esc(label(a))} (${fmt(a.giacenza)} ${esc(a.unita)})</option>`).join("") : `<option value="">Nessun articolo in ${esc(outGroup.toLowerCase())}</option>`}</select>
+    ${sel && hasLot(sel) ? (() => { const ls = lotsOf(sel); return `
+    <label for="oLot">Lotto</label>
+    ${ls.length ? `<select id="oLot">${ls.map(([l, q], i) => `<option value="${esc(l)}"${l === outLot || (!outLot && i === 0) ? " selected" : ""}>${esc(l)} — ${fmt(q)} ${esc(sel.unita)}${i === 0 ? " (più vecchio)" : ""}</option>`).join("")}</select>`
+      : `<div class="hint">Nessun lotto in magazzino.</div>`}
+    ${outTipo === "RETTIFICA" ? `<input id="oLotNew" maxlength="20" autocomplete="off" autocapitalize="characters" placeholder="oppure scrivi un altro lotto" style="margin-top:6px">` : ""}`; })()
+      : sel ? `<div class="hint">Disponibili: <b>${fmt(sel.giacenza)} ${esc(sel.unita)}</b></div>` : ""}
+    <label for="oQty">Quantità</label>
+    <input id="oQty" type="text" inputmode="${outTipo === "RETTIFICA" ? "text" : "decimal"}" autocomplete="off" placeholder="${outTipo === "RETTIFICA" ? "es. -3 oppure 5" : "0"}">
+    ${outTipo === "RETTIFICA" ? `<div class="hint">Per rotture, errori o conteggi: negativo toglie, positivo aggiunge.</div>` : ""}
+    <label for="oNota">Nota ${outTipo === "RETTIFICA" ? "(obbligatoria)" : "(facoltativa)"}</label>
+    <input id="oNota" type="text" maxlength="200" autocomplete="off" placeholder="${outTipo === "RETTIFICA" ? "es. 2 bottiglie rotte" : "es. cliente, ordine"}">
+    <button class="btn ${outTipo === "SCARICO" ? "out" : "adj"}" id="oSave">${outTipo === "SCARICO" ? "Registra uscita" : "Registra correzione"}</button>
+  </div>
+  <h2>Ultime uscite e correzioni</h2><div class="card">${movRows(S.movements.filter(m => m.tipo !== "CARICO").slice(0, 5)) || '<div class="s">Ancora nessuna uscita.</div>'}</div>`;
+  document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { outGroup = b.dataset.g; outArt = ""; outLot = ""; vOut(); });
+  document.querySelectorAll(".kind button").forEach(b => b.onclick = () => { outArt = $("oArt").value; outTipo = b.dataset.t; vOut(); });
+  $("oArt").onchange = e => { outArt = e.target.value; outLot = ""; vOut(); };
+  if ($("oLot")) $("oLot").onchange = e => outLot = e.target.value;
+  $("oSave").onclick = () => run(async () => {
+    const id = $("oArt").value, q = num($("oQty").value), nota = $("oNota").value.trim();
+    if (!id) throw new Error("Scegli l'articolo.");
+    if (!isFinite(q) || q === 0 || (outTipo === "SCARICO" && q < 0)) throw new Error("Quantità non valida.");
+    if (outTipo === "RETTIFICA" && !nota) throw new Error("Scrivi il motivo nella nota.");
+    const lotto = normLot(($("oLotNew") && $("oLotNew").value) || ($("oLot") && $("oLot").value) || "");
+    if (hasLot(sel) && !lotto) throw new Error("Scegli il lotto.");
+    S = await api("move", { tipo: outTipo, articoloId: id, quantita: q, nota, lotto });
+    outArt = id; toast((outTipo === "SCARICO" ? "Uscita registrata" : "Correzione registrata") + (lotto ? " · lotto " + lotto : "")); vOut();
   });
 }
 
 function movRows(list) {
   return list.map(m => {
     const d = new Date(m.data), when = isNaN(d) ? esc(m.data) : d.toLocaleString("it-IT", { day:"2-digit", month:"2-digit", year:"2-digit", hour:"2-digit", minute:"2-digit" });
-    return `<div class="row"><div><div class="t">${esc(m.articolo)}</div><div class="s">${when} · ${esc(m.tipo.toLowerCase())} · ${esc(m.utente)}${m.nota ? " · " + esc(m.nota) : ""}</div></div>
+    const tl = { CARICO:"entrata", SCARICO:"uscita", RETTIFICA:"correzione" }[m.tipo] || m.tipo.toLowerCase();
+    return `<div class="row"><div><div class="t">${esc(m.articolo)}</div><div class="s">${when} · ${esc(tl)} · ${esc(m.utente)}${m.lotto ? " · lotto " + esc(m.lotto) : ""}${m.nota ? " · " + esc(m.nota) : ""}</div></div>
     <div class="qty ${m.variazione >= 0 ? "pos" : "neg"}">${m.variazione > 0 ? "+" : ""}${fmt(m.variazione)}</div></div>`;
   }).join("");
 }
 
 /* ---------- GIACENZE ---------- */
 function vStock() {
-  const list = active(), low = list.filter(a => a.soglia > 0 && a.giacenza <= a.soglia).length;
+  const list = active(), off = S.articles.filter(a => !a.attivo && groupOf(a) === stockTab);
+  const tabLow = g => list.some(a => groupOf(a) === g && isLowA(a));
   $("main").innerHTML = `
-  <input id="sQ" type="search" placeholder="Cerca articolo…" value="${esc(stockQ)}">
-  ${low ? `<div class="hint low"><b>${low}</b> ${low === 1 ? "articolo è" : "articoli sono"} sotto la soglia minima.</div>` : ""}
+  ${groupTabs(stockTab, g => ` <small>${list.filter(a => groupOf(a) === g).length}</small>${tabLow(g) ? `<span class="dot"></span>` : ""}`)}
+  <input id="sQ" type="search" placeholder="Cerca in ${esc(stockTab.toLowerCase())}…" value="${esc(stockQ)}" style="margin-top:12px">
   <div id="sList"></div>
+  ${off.length ? `<details class="hint" style="margin-top:12px"><summary>Articoli disattivati (${off.length})</summary><div class="card" style="margin-top:8px">${sortL(off).map(a => `<div class="row off" data-id="${esc(a.id)}"><div class="t">${esc(label(a))}</div><div class="s">Apri ›</div></div>`).join("")}</div></details>` : ""}
+  <div class="hint">Tocca un articolo per modificarlo, impostare l'avviso di scorta bassa o unire un doppione.</div>
   <button class="btn sec" id="sCsv">Scarica giacenze (Excel)</button>`;
   const draw = () => {
-    const q = stockQ.toLowerCase(), g = byCat(list.filter(a => label(a).toLowerCase().includes(q)));
-    $("sList").innerHTML = g.map(([c, as]) => `<h2>${esc(c)}</h2><div class="card">` + as.map(a => {
-      const isLow = a.soglia > 0 && a.giacenza <= a.soglia;
-      return `<div class="row" data-id="${esc(a.id)}"><div><div class="t">${esc(a.nome)}${isLow ? '<span class="badge">scorta bassa</span>' : ""}</div>${a.formato ? `<div class="s">${esc(a.formato)}</div>` : ""}</div>
-      <div class="qty ${isLow ? "low" : ""}">${fmt(a.giacenza)} <small>${esc(a.unita)}</small></div></div>`;
-    }).join("") + "</div>").join("") || '<div class="center">Nessun articolo trovato.</div>';
-    document.querySelectorAll("#sList .row").forEach(r => r.onclick = () => { movArt = r.dataset.id; view = "mov"; render(); });
+    const q = stockQ.toLowerCase();
+    const as = sortL(list.filter(a => groupOf(a) === stockTab && label(a).toLowerCase().includes(q)));
+    const low = as.filter(isLowA).length;
+    $("sList").innerHTML = (low ? `<div class="hint low"><b>${low}</b> ${low === 1 ? "articolo è" : "articoli sono"} sotto la soglia minima.</div>` : "") +
+      (as.length ? `<div class="card" style="margin-top:12px">` + as.map(a => `<div class="row" data-id="${esc(a.id)}"><div><div class="t">${esc(a.nome)}${isLowA(a) ? '<span class="badge">scorta bassa</span>' : ""}</div>${a.formato ? `<div class="s">${esc(a.formato)}${hasLot(a) && lotsOf(a).length ? " · " + (lotsOf(a).length === 1 ? "lotto " + esc(lotsOf(a)[0][0]) : lotsOf(a).length + " lotti") : ""}</div>` : ""}</div>
+      <div class="qty ${isLowA(a) ? "low" : ""}">${fmt(a.giacenza)} <small>${esc(a.unita)}</small></div></div>`).join("") + "</div>"
+      : `<div class="center">${q ? "Nessun articolo trovato." : "Nessun articolo in questa sezione."}</div>`);
+    bindRows();
   };
+  const bindRows = () => document.querySelectorAll("#main .row").forEach(r => r.onclick = () => { editId = r.dataset.id; view = "art"; render(); });
   draw();
+  document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => { stockTab = b.dataset.g; stockQ = ""; vStock(); });
   $("sQ").oninput = e => { stockQ = e.target.value; draw(); };
-  $("sCsv").onclick = () => csv("giacenze", [["Categoria", "Articolo", "Formato", "Giacenza", "Unità", "Soglia minima"]].concat(
-    byCat(list).flatMap(g => g[1]).map(a => [a.categoria, a.nome, a.formato, a.giacenza, a.unita, a.soglia])));
+  $("sCsv").onclick = () => csv("giacenze", [["Sezione", "Articolo", "Formato", "Giacenza", "Unità", "Soglia minima", "Lotti"]].concat(
+    GROUPS.flatMap(g => sortL(list.filter(a => groupOf(a) === g)).map(a => [g, a.nome, a.formato, a.giacenza, a.unita, a.soglia, lotsTxt(a)]))));
 }
 
 /* ---------- REGISTRO ---------- */
@@ -231,7 +337,7 @@ function vLog() {
   $("main").innerHTML = `
   <div class="two">
     <div><select id="fArt"><option value="">Tutti gli articoli</option>${artOptions(S.articles, filt.art)}</select></div>
-    <div><select id="fTipo"><option value="">Tutti i tipi</option>${["CARICO", "SCARICO", "RETTIFICA"].map(t => `<option${t === filt.tipo ? " selected" : ""} value="${t}">${t[0] + t.slice(1).toLowerCase()}</option>`).join("")}</select></div>
+    <div><select id="fTipo"><option value="">Tutti i tipi</option>${[["CARICO", "Entrate"], ["SCARICO", "Uscite"], ["RETTIFICA", "Correzioni"]].map(([t, l]) => `<option${t === filt.tipo ? " selected" : ""} value="${t}">${l}</option>`).join("")}</select></div>
   </div>
   <div class="card" style="margin-top:12px">${movRows(list) || '<div class="s">Nessun movimento.</div>'}</div>
   ${S.totalMovements > S.movements.length ? `<div class="hint">Mostrati gli ultimi ${S.movements.length} movimenti su ${S.totalMovements}. Lo scaricamento li contiene tutti.</div>` : ""}
@@ -240,46 +346,86 @@ function vLog() {
   $("fTipo").onchange = e => { filt.tipo = e.target.value; vLog(); };
   $("lCsv").onclick = () => run(async () => {
     const all = await api("state", { limit: 100000 });
-    csv("movimenti", [["Data e ora", "Tipo", "Articolo", "Quantità", "Variazione", "Nota", "Utente"]].concat(
-      all.movements.map(m => [new Date(m.data).toLocaleString("it-IT"), m.tipo, m.articolo, m.quantita, m.variazione, m.nota, m.utente])));
+    csv("movimenti", [["Data e ora", "Tipo", "Articolo", "Lotto", "Quantità", "Variazione", "Nota", "Utente"]].concat(
+      all.movements.map(m => [new Date(m.data).toLocaleString("it-IT"), m.tipo, m.articolo, m.lotto || "", m.quantita, m.variazione, m.nota, m.utente])));
   });
 }
 
-/* ---------- ARTICOLI ---------- */
+/* ---------- SCHEDA ARTICOLO (da Giacenze) ---------- */
 function vArt() {
-  const a = editId ? S.articles.find(x => x.id === editId) : null;
-  if (editId !== null) {
-    $("main").innerHTML = `
-    <div class="card">
-      <label for="aCat">Categoria</label>
-      <select id="aCat">${["Birre", "Materiali"].map(c => `<option${a && a.categoria === c ? " selected" : ""}>${c}</option>`).join("")}</select>
-      <label for="aNome">Nome</label><input id="aNome" maxlength="60" autocomplete="off" value="${esc(a ? a.nome : "")}" placeholder="es. IPA, Scatola da 12">
-      <label for="aFor">Formato (facoltativo)</label><input id="aFor" maxlength="40" autocomplete="off" value="${esc(a ? a.formato : "")}" placeholder="es. 33 cl, fusto 20 L">
-      <div class="two">
-        <div><label for="aUni">Unità</label><input id="aUni" maxlength="15" autocomplete="off" value="${esc(a ? a.unita : "pz")}"></div>
-        <div><label for="aSog">Soglia minima</label><input id="aSog" inputmode="decimal" autocomplete="off" value="${a ? a.soglia : 0}"></div>
-      </div>
-      <div class="hint">Sotto la soglia l'articolo viene segnalato come "scorta bassa". 0 = nessun avviso.</div>
-      ${a ? `<label for="aAtt">Stato</label><select id="aAtt"><option value="1"${a.attivo ? " selected" : ""}>Attivo</option><option value="0"${a.attivo ? "" : " selected"}>Disattivato (nascosto, storico conservato)</option></select>` : ""}
-      <button class="btn" id="aSave">Salva</button>
-      <button class="btn sec" id="aBack">Annulla</button>
-    </div>`;
-    $("aBack").onclick = () => { editId = null; vArt(); };
-    $("aSave").onclick = () => run(async () => {
-      const article = { id: a ? a.id : "", categoria: $("aCat").value, nome: $("aNome").value.trim(), formato: $("aFor").value.trim(), unita: $("aUni").value.trim(),
-        soglia: Number($("aSog").value.replace(",", ".")) || 0, attivo: a ? $("aAtt").value === "1" : true };
-      if (!article.nome) throw new Error("Scrivi il nome.");
-      S = await api("saveArticle", { article });
-      editId = null; toast("Salvato"); vArt();
+  const a = S.articles.find(x => x.id === editId);
+  if (!a) { view = "stock"; return render(); }
+  const g = groupOf(a), forms = g === "Materiali" ? null : FORMATS_OF[g].concat(FORMATS_OF[g].includes(a.formato) || !a.formato ? [] : [a.formato]);
+  const goBack = () => { editId = null; view = "stock"; render(); };
+  $("main").innerHTML = `
+  <button class="btn sec" id="aBack" style="margin-top:0">‹ Torna a Giacenze</button>
+  <div class="card" style="margin-top:12px">
+    <div class="t" style="font-size:18px">${esc(label(a))}</div>
+    <div class="s">${g} · giacenza <b>${fmt(a.giacenza)} ${esc(a.unita)}</b></div>
+    ${hasLot(a) ? `<div style="margin-top:10px">${lotsOf(a).length ? lotsOf(a).map(([l, q], i) => `<div class="row"><div class="t">Lotto ${esc(l)}${i === 0 && lotsOf(a).length > 1 ? ' <span class="s">più vecchio</span>' : ""}</div><div class="qty">${fmt(q)} <small>${esc(a.unita)}</small></div></div>`).join("") : '<div class="s">Nessun lotto in magazzino.</div>'}</div>` : ""}
+    ${a.attivo && hasLot(a) ? `<label for="aLot">Lotto</label><input id="aLot" list="lotsOf${esc(a.id)}" maxlength="20" autocomplete="off" autocapitalize="characters" value="${esc(lotsOf(a).length ? lotsOf(a)[0][0] : "")}" placeholder="es. L2611">${lotList(a)}` : ""}
+    ${a.attivo ? `<label for="aQty">Quantità</label>
+    <input id="aQty" type="text" inputmode="decimal" autocomplete="off" placeholder="0">
+    <label for="aNota">Nota (facoltativa)</label>
+    <input id="aNota" type="text" maxlength="200" autocomplete="off" placeholder="es. cliente, ordine">
+    <div class="two" style="margin-top:12px">
+      <div><button class="btn in" id="aIn" style="margin-top:0">+ Registra entrata</button></div>
+      <div><button class="btn out" id="aOut" style="margin-top:0">− Registra uscita</button></div>
+    </div>` : `<div class="hint">Articolo disattivato: riattivalo qui sotto per registrare entrate o uscite.</div>`}
+  </div>
+  <h2>Modifica</h2>
+  <div class="card">
+    <label for="aNome" style="margin-top:0">Nome</label><input id="aNome" maxlength="60" autocomplete="off" value="${esc(a.nome)}">
+    ${forms ? `<label for="aFor">Formato</label><select id="aFor">${forms.map(f => `<option${a.formato === f ? " selected" : ""}>${esc(f)}</option>`).join("")}</select>`
+      : `<label for="aUni">Si conta in</label><select id="aUni">${["pz", "scatole", "kg", "L"].concat(["pz", "scatole", "kg", "L"].includes(a.unita) ? [] : [a.unita]).map(u => `<option value="${esc(u)}"${a.unita === u ? " selected" : ""}>${esc(UNIT_LABEL[u] || u)}</option>`).join("")}</select>`}
+    <label for="aSog">Avvisami quando scende sotto</label>
+    <input id="aSog" inputmode="decimal" autocomplete="off" placeholder="nessun avviso" value="${a.soglia ? a.soglia : ""}">
+    <label for="aAtt">Stato</label><select id="aAtt"><option value="1"${a.attivo ? " selected" : ""}>Attivo</option><option value="0"${a.attivo ? "" : " selected"}>Disattivato (nascosto, storico conservato)</option></select>
+    <div class="hint">La giacenza qui non si modifica: si cambia solo con entrate, uscite o correzioni, così il Registro resta corretto.</div>
+    <button class="btn" id="aSave">Salva modifiche</button>
+  </div>
+  ${a.attivo ? `<h2>Doppione?</h2><div class="card">
+    <label for="aMerge" style="margin-top:0">Unisci con…</label>
+    <select id="aMerge"><option value="">Scegli l'articolo giusto…</option>${artOptions(S.articles.filter(x => x.attivo && x.id !== a.id && x.unita === a.unita), "", true)}</select>
+    <div class="hint">La giacenza di questo articolo viene spostata su quello scelto con due correzioni nel Registro, poi questo viene disattivato.</div>
+    <button class="btn sec" id="aMergeBtn">Unisci</button>
+  </div>` : ""}
+  <h2>Ultimi movimenti di questo articolo</h2><div class="card">${movRows(S.movements.filter(m => m.articoloId === a.id).slice(0, 5)) || '<div class="s">Nessun movimento.</div>'}</div>`;
+  $("aBack").onclick = goBack;
+  const quick = tipo => run(async () => {
+    const q = num($("aQty").value);
+    if (!isFinite(q) || q <= 0) throw new Error("Scrivi una quantità valida.");
+    const lotto = $("aLot") ? normLot($("aLot").value) : "";
+    if ($("aLot") && !lotto) throw new Error("Scrivi il lotto.");
+    S = await api("move", { tipo, articoloId: a.id, quantita: q, nota: $("aNota").value.trim(), lotto });
+    toast((tipo === "CARICO" ? "Entrata registrata: +" : "Uscita registrata: −") + fmt(q) + (lotto ? " · lotto " + lotto : "")); vArt();
+  });
+  if ($("aIn")) { $("aIn").onclick = () => quick("CARICO"); $("aOut").onclick = () => quick("SCARICO"); }
+  $("aSave").onclick = () => run(async () => {
+    const article = { id: a.id, categoria: a.categoria, nome: tidy($("aNome").value), formato: forms ? $("aFor").value : a.formato,
+      unita: forms ? (/^fusto/i.test($("aFor").value) ? "fusti" : "bt") : $("aUni").value, soglia: num($("aSog").value) || 0, attivo: $("aAtt").value === "1" };
+    if (!article.nome) throw new Error("Scrivi il nome.");
+    const dup = S.articles.find(x => x.id !== a.id && artKey(x.nome, x.formato) === artKey(article.nome, article.formato));
+    if (dup && article.attivo) throw new Error("Esiste già: " + label(dup) + ". Se sono lo stesso articolo usa \"Unisci\".");
+    S = await api("saveArticle", { article });
+    toast("Salvato"); vArt();
+  });
+  if ($("aMergeBtn")) {
+    let armed = "";
+    $("aMerge").onchange = () => { armed = ""; $("aMergeBtn").textContent = "Unisci"; };
+    $("aMergeBtn").onclick = () => run(async () => {
+      const t = S.articles.find(x => x.id === $("aMerge").value);
+      if (!t) throw new Error("Scegli con quale articolo unirlo.");
+      if (armed !== t.id) { armed = t.id; $("aMergeBtn").textContent = `Conferma: sposta ${fmt(a.giacenza)} ${a.unita} su ${label(t)}`; return; }
+      const parts = hasLot(a) ? lotsOf(a) : (a.giacenza !== 0 ? [["", a.giacenza]] : []);
+      for (const [lotto, q] of parts) {
+        S = await api("move", { tipo: "RETTIFICA", articoloId: a.id, quantita: -q, nota: "Unito in " + label(t), lotto });
+        S = await api("move", { tipo: "RETTIFICA", articoloId: t.id, quantita: q, nota: "Unito da " + label(a), lotto });
+      }
+      S = await api("saveArticle", { article: { id: a.id, categoria: a.categoria, nome: a.nome, formato: a.formato, unita: a.unita, soglia: a.soglia, attivo: false } });
+      editId = t.id; toast("Articoli uniti"); vArt();
     });
-    return;
   }
-  $("main").innerHTML = `<button class="btn" id="aNew" style="margin-top:0">+ Nuovo articolo</button>` +
-    (byCat(S.articles).map(([c, as]) => `<h2>${esc(c)}</h2><div class="card">` + as.map(x =>
-      `<div class="row ${x.attivo ? "" : "off"}" data-id="${esc(x.id)}"><div><div class="t">${esc(x.nome)}</div><div class="s">${esc([x.formato, x.unita, x.attivo ? "" : "disattivato"].filter(Boolean).join(" · "))}</div></div><div class="s">Modifica ›</div></div>`
-    ).join("") + "</div>").join("") || '<div class="center">Nessun articolo.</div>');
-  $("aNew").onclick = () => { editId = ""; vArt(); };
-  document.querySelectorAll("#main .row").forEach(r => r.onclick = () => { editId = r.dataset.id; vArt(); });
 }
 
 /* ---------- ESPORTAZIONE ---------- */
@@ -317,6 +463,7 @@ async function start() {
     $("main").innerHTML = '<div class="center">Impossibile caricare i dati.<br><br><button class="btn sec" onclick="location.reload()">Riprova</button></div>';
   }
 }
+
 start();
 </script>
 </body>
