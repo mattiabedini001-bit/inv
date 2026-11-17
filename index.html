@@ -14,7 +14,8 @@
   :root { --bg:#f4f2ee; --card:#fff; --ink:#1f2a2e; --mute:#6b7478; --line:#e2ded6; --acc:#b9770e; --in:#2e7d4f; --out:#b23b3b; --adj:#3a6ea5; }
   * { box-sizing:border-box; }
   html, body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  header { background:var(--ink); color:#fff; padding:calc(12px + env(safe-area-inset-top)) 16px 12px; display:flex; justify-content:space-between; align-items:center; position:sticky; top:0; z-index:5; }
+  header { background:var(--ink); color:#fff; padding:calc(12px + env(safe-area-inset-top)) 16px 12px; display:flex; justify-content:space-between; align-items:center; }
+  .top { position:sticky; top:0; z-index:5; }
   header h1 { font-size:18px; margin:0; }
   header button { background:none; border:1px solid #ffffff55; color:#fff; border-radius:8px; padding:6px 10px; font-size:13px; }
   main { padding:16px 16px calc(90px + env(safe-area-inset-bottom)); max-width:640px; margin:0 auto; }
@@ -59,6 +60,11 @@
   .btn.in { background:var(--in); } .btn.out { background:var(--out); } .btn.adj { background:var(--adj); }
   .seg button.on[data-t=SCARICO] { background:var(--out); color:#fff; border-color:var(--out); }
   .newbox { border-left:3px solid var(--in); padding-left:10px; margin-top:4px; }
+  #sync { font-size:13px; padding:8px 16px; background:#e9e6df; color:var(--mute); display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  #sync.wait { background:#fbecd3; color:#7a4e06; }
+  #sync.bad { background:#f7e3e3; color:var(--out); }
+  #sync button { background:#fff; border:1px solid currentColor; color:inherit; border-radius:8px; padding:4px 10px; font:inherit; font-weight:700; white-space:nowrap; }
+  .badge.wait { background:#fbecd3; color:#7a4e06; }
 </style>
 </head>
 <body>
@@ -83,7 +89,8 @@
 </div>
 
 <div id="app" class="hide">
-  <header><h1>Inventario</h1><div><span id="who" style="font-size:13px;margin-right:8px"></span><button id="btnOut">Esci</button></div></header>
+  <div class="top"><header><h1>Inventario</h1><div><span id="who" style="font-size:13px;margin-right:8px"></span><button id="btnOut">Esci</button></div></header>
+  <div id="sync"></div></div>
   <main id="main"></main>
   <nav>
     <button data-v="in">Entrate</button>
@@ -115,6 +122,21 @@ const store = {
 };
 let token = store.get();
 
+/* ---------- LAVORO SENZA RETE ----------
+   base  = ultimo stato ricevuto dallo script (salvato sul telefono)
+   queue = movimenti fatti sul telefono e non ancora confermati dallo script
+   S     = base + queue: è quello che si vede nell'app */
+const BKEY = "inv_base", QKEY = "inv_queue", RKEY = "inv_rejected";
+const ls = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
+  set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+let base = ls.get(BKEY, null), queue = ls.get(QKEY, []), rejected = ls.get(RKEY, []), flushing = false, lastRefresh = 0;
+const saveQ = () => ls.set(QKEY, queue);
+const uid = () => { try { if (crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
+  const b = new Uint8Array(16); crypto.getRandomValues(b); return [...b].map(x => x.toString(16).padStart(2, "0")).join(""); };
+const r3 = n => Math.round(n * 1000) / 1000;
+
 function toast(msg, err) {
   const t = $("toast"); t.textContent = msg; t.className = err ? "err" : ""; t.style.display = "block";
   clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = "none", err ? 4500 : 2200);
@@ -129,16 +151,151 @@ async function api(action, data) {
       body: JSON.stringify(Object.assign({ action, token }, data || {}))
     });
     res = await r.json();
-  } catch (e) { throw new Error("Connessione assente o servizio non raggiungibile."); }
+  } catch (e) { throw Object.assign(new Error("Connessione assente o servizio non raggiungibile."), { net: true }); }
   if (!res.ok) {
     if (res.code === "AUTH") { token = ""; store.set(""); showLogin(); }
-    throw new Error(res.error || "Errore");
+    throw Object.assign(new Error(res.error || "Errore"), { auth: res.code === "AUTH" });
   }
   return res;
 }
 
+function setBase(st) {
+  const keep = { user: S.user };
+  base = st; base.savedAt = Date.now(); if (!base.user) base.user = keep.user;
+  ls.set(BKEY, base); derive();
+}
+function derive() {
+  S = JSON.parse(JSON.stringify(base || S));
+  queue.forEach(it => applyLocal(S, it));
+  syncBar();
+}
+function applyLocal(st, it) {
+  if (it.kind === "article") {
+    const a = st.articles.find(x => x.id === it.article.id);
+    if (a) Object.assign(a, it.article);
+    else st.articles.push(Object.assign({ giacenza: 0, lotti: [], soglia: 0, attivo: true }, it.article));
+    return;
+  }
+  const a = st.articles.find(x => x.id === it.articoloId); if (!a) return;
+  const v = it.tipo === "CARICO" ? it.quantita : it.tipo === "SCARICO" ? -it.quantita : it.quantita;
+  a.giacenza = r3(a.giacenza + v);
+  if (it.lotto) {
+    const arr = lotsOf(a).map(x => [x[0], x[1]]), l = arr.find(x => x[0] === it.lotto);
+    if (l) l[1] = r3(l[1] + v); else arr.push([it.lotto, v]);
+    a.lotti = arr.filter(x => x[1] !== 0);
+  }
+  st.movements.unshift({ data: it.quando, tipo: it.tipo, articoloId: a.id, articolo: label(a), quantita: Math.abs(it.quantita), variazione: v,
+    nota: it.nota, utente: st.user, lotto: it.lotto, pending: true });
+  st.totalMovements = (st.totalMovements || 0) + 1;
+}
+
+/* Controllo sul telefono: anche senza rete non si scarica più di quanto risulta. */
+function checkStock(m) {
+  const a = S.articles.find(x => x.id === m.articoloId); if (!a) throw new Error("Articolo non trovato.");
+  const v = m.tipo === "CARICO" ? m.quantita : m.tipo === "SCARICO" ? -m.quantita : m.quantita;
+  if (v >= 0) return;
+  if (m.lotto) { const l = lotsOf(a).find(x => x[0] === m.lotto), have = l ? l[1] : 0;
+    if (have + v < -1e-9) throw new Error(`Nel lotto ${m.lotto} risultano solo ${fmt(have)} ${a.unita}.`); }
+  if (a.giacenza + v < -1e-9) throw new Error(`Risultano solo ${fmt(a.giacenza)} ${a.unita}.`);
+}
+
+/* Registra un movimento: se c'è rete va subito allo script, altrimenti resta in coda sul telefono. */
+async function submitMove(m) {
+  checkStock(m);
+  const it = Object.assign({ kind: "move", uid: uid(), quando: new Date().toISOString() }, m);
+  if (!queue.length && navigator.onLine !== false) {
+    try { setBase(await api("move", moveBody(it))); return true; }
+    catch (e) { if (!e.net) throw e; }
+  }
+  it.offline = true; queue.push(it); saveQ(); derive();
+  return false;
+}
+const moveBody = it => ({ tipo: it.tipo, articoloId: it.articoloId, quantita: it.quantita, nota: it.nota, lotto: it.lotto, uid: it.uid, quando: it.quando, offline: !!it.offline });
+
+/* Crea o riattiva un articolo. Senza rete l'articolo nuovo riceve un codice provvisorio. Restituisce l'id. */
+async function submitArticle(article) {
+  if (!queue.length && navigator.onLine !== false) {
+    try {
+      const before = new Set(S.articles.map(x => x.id)), st = await api("saveArticle", { article });
+      setBase(st);
+      return article.id || (S.articles.find(x => !before.has(x.id)) || {}).id;
+    } catch (e) { if (!e.net) throw e; }
+  }
+  const art = Object.assign({}, article);
+  if (!art.id) art.id = "tmp-" + uid().slice(0, 12);
+  queue.push({ kind: "article", uid: uid(), article: art }); saveQ(); derive();
+  return art.id;
+}
+const queued = ok => ok ? "" : " · partirà appena c'è rete";
+
+/* Invia la coda, un movimento alla volta e nell'ordine in cui sono stati fatti. */
+async function flush() {
+  if (flushing || !queue.length || !token || !API_URL) return;
+  flushing = true; syncBar();
+  try {
+    while (queue.length) {
+      const it = queue[0]; let st = null;
+      try {
+        if (it.kind === "article") {
+          const tmp = it.article.id.startsWith("tmp-"), body = Object.assign({}, it.article, { id: tmp ? "" : it.article.id });
+          const before = new Set(base.articles.map(x => x.id)); let realId = it.article.id;
+          try { st = await api("saveArticle", { article: body }); if (tmp) realId = (st.articles.find(x => !before.has(x.id)) || {}).id; }
+          catch (e) {
+            if (e.net || e.auth || !tmp) throw e;
+            const ex = base.articles.find(x => artKey(x.nome, x.formato) === artKey(it.article.nome, it.article.formato));
+            if (!ex) throw e; realId = ex.id;   // era già stato creato: si usa quello
+          }
+          if (tmp && realId) {
+            queue.forEach(q => { if (q.articoloId === it.article.id) q.articoloId = realId; });
+            if (inArt === it.article.id) inArt = realId; if (outArt === it.article.id) outArt = realId; if (editId === it.article.id) editId = realId;
+          }
+        } else {
+          st = await api("move", moveBody(it));
+        }
+      } catch (e) {
+        if (e.net || e.auth) throw e;
+        const a = (S.articles.find(x => x.id === (it.articoloId || (it.article || {}).id)) || it.article || {});
+        rejected.push({ quando: it.quando || new Date().toISOString(), tipo: it.kind === "article" ? "ARTICOLO" : it.tipo, articolo: a.nome ? label(a) : "",
+          quantita: it.quantita, lotto: it.lotto || "", nota: it.nota || "", errore: e.message });
+        ls.set(RKEY, rejected);
+      }
+      queue.shift(); saveQ();
+      if (st) setBase(st); else derive();
+    }
+  } catch (e) { /* senza rete o sessione scaduta: la coda resta sul telefono */ }
+  flushing = false; syncBar();
+  if (!queue.length && (view === "stock" || view === "log" || view === "rej")) render();
+}
+
+async function refresh(force) {
+  if (!token || !API_URL || (!force && Date.now() - lastRefresh < 60000)) return;
+  lastRefresh = Date.now();
+  try { await flush(); if (!queue.length) { setBase(await api("state")); if (view === "stock" || view === "log") render(); } } catch (e) {}
+  syncBar();
+}
+
+function syncBar() {
+  const b = $("sync"); if (!b) return;
+  const at = base && base.savedAt ? new Date(base.savedAt) : null;
+  const when = !at ? "mai" : at.toDateString() === new Date().toDateString()
+    ? "alle " + at.toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })
+    : "il " + at.toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const n = queue.filter(q => q.kind === "move").length || queue.length;
+  if (rejected.length) {
+    b.className = "bad"; b.innerHTML = `<span><b>${rejected.length}</b> ${rejected.length === 1 ? "movimento non accettato" : "movimenti non accettati"}</span><button id="syncRej">Vedi</button>`;
+    $("syncRej").onclick = () => { view = "rej"; render(); };
+  } else if (queue.length) {
+    b.className = "wait"; b.innerHTML = `<span>${flushing ? "Invio in corso…" : navigator.onLine === false ? "Senza rete" : "Non inviati"} · <b>${n}</b> ${n === 1 ? "movimento in attesa" : "movimenti in attesa"}</span>${flushing ? "" : `<button id="syncNow">Invia ora</button>`}`;
+    if ($("syncNow")) $("syncNow").onclick = () => { flush(); };
+  } else {
+    b.className = ""; b.innerHTML = `<span>Giacenze aggiornate ${esc(when)}</span><button id="syncNow">Aggiorna</button>`;
+    $("syncNow").onclick = () => refresh(true);
+  }
+}
+
+
 function showLogin() { $("app").classList.add("hide"); $("login").classList.remove("hide"); $("pin").value = ""; $("pin").focus(); }
-function showApp() { $("login").classList.add("hide"); $("app").classList.remove("hide"); $("who").textContent = S.user; render(); }
+function showApp() { $("login").classList.add("hide"); $("app").classList.remove("hide"); $("who").textContent = S.user; syncBar(); render(); }
 
 async function run(fn) {
   if (busy) return; busy = true;
@@ -153,11 +310,15 @@ $("btnLogin").onclick = () => run(async () => {
   if (!/^\d{4,12}$/.test(pin)) throw new Error("Inserisci il PIN.");
   const r = await api("login", { pin });
   token = r.token; store.set(token);
-  S = await api("state");
-  showApp();
+  setBase(await api("state")); lastRefresh = Date.now();
+  showApp(); flush();
 });
 $("pin").addEventListener("keydown", e => { if (e.key === "Enter") $("btnLogin").click(); });
-$("btnOut").onclick = async () => { try { await api("logout"); } catch (e) {} token = ""; store.set(""); showLogin(); };
+$("btnOut").onclick = async () => {
+  if (queue.length) return toast("Ci sono movimenti non ancora inviati: esci quando c'è rete e sono partiti.", true);
+  try { await api("logout"); } catch (e) {}
+  token = ""; store.set(""); base = null; ls.set(BKEY, null); rejected = []; ls.set(RKEY, null); showLogin();
+};
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => { view = b.dataset.v; editId = null; render(); });
 
 const UNITS = ["bt", "fusti", "scatole", "pz", "kg", "L"];
@@ -170,7 +331,7 @@ const label = a => a.nome + (a.formato ? " - " + a.formato : "");
 const active = () => S.articles.filter(a => a.attivo);
 const GROUPS = ["Materiali", "Bottiglie", "Fusti"];
 const groupOf = a => a.categoria !== "Birre" ? "Materiali" : (/^fust/i.test(a.formato || "") || a.unita === "fusti") ? "Fusti" : "Bottiglie";
-const isLowA = a => a.soglia > 0 && a.giacenza <= a.soglia;
+const isLowA = a => a.giacenza < 0 || (a.soglia > 0 && a.giacenza <= a.soglia);
 const sortL = l => l.slice().sort((x, y) => label(x).localeCompare(label(y), "it"));
 const byCat = list => GROUPS.map(g => [g, sortL(list.filter(a => groupOf(a) === g))]).filter(g => g[1].length);
 const artOptions = (list, sel, withStock) => byCat(list).map(([c, as]) =>
@@ -188,7 +349,7 @@ let inGroup = "Bottiglie", inArt = "", outTipo = "SCARICO", outLot = "", outArt 
 
 function render() {
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.v === view));
-  ({ in: vIn, out: vOut, stock: vStock, log: vLog, art: vArt })[view]();
+  ({ in: vIn, out: vOut, stock: vStock, log: vLog, art: vArt, rej: vRej })[view]();
   window.scrollTo(0, 0);
 }
 
@@ -239,17 +400,16 @@ function vIn() {
       const ex = S.articles.find(x => artKey(x.nome, x.formato) === artKey(nome, formato));
       if (ex) {
         id = ex.id; msg = "Già presente: aggiunto a " + label(ex);
-        if (!ex.attivo) S = await api("saveArticle", { article: { id: ex.id, categoria: ex.categoria, nome: ex.nome, formato: ex.formato, unita: ex.unita, soglia: ex.soglia, attivo: true } });
+        if (!ex.attivo) await submitArticle({ id: ex.id, categoria: ex.categoria, nome: ex.nome, formato: ex.formato, unita: ex.unita, soglia: ex.soglia, attivo: true });
       } else {
-        const before = new Set(S.articles.map(x => x.id));
-        S = await api("saveArticle", { article: { id: "", categoria: inGroup === "Materiali" ? "Materiali" : "Birre", nome, formato,
-          unita: inGroup === "Materiali" ? $("iUni").value : inGroup === "Fusti" ? "fusti" : "bt", soglia: 0, attivo: true } });
-        id = (S.articles.find(x => !before.has(x.id)) || {}).id; msg = "Nuovo articolo creato";
+        id = await submitArticle({ id: "", categoria: inGroup === "Materiali" ? "Materiali" : "Birre", nome, formato,
+          unita: inGroup === "Materiali" ? $("iUni").value : inGroup === "Fusti" ? "fusti" : "bt", soglia: 0, attivo: true });
+        msg = "Nuovo articolo creato";
       }
     }
     if (!isFinite(q) || q <= 0) throw new Error("Quantità non valida.");
-    S = await api("move", { tipo: "CARICO", articoloId: id, quantita: q, nota, lotto });
-    inArt = id; toast(msg + (lotto ? " · lotto " + lotto : "")); vIn();
+    const ok = await submitMove({ tipo: "CARICO", articoloId: id, quantita: q, nota, lotto });
+    inArt = id; toast((ok ? msg : "Entrata salvata sul telefono") + (lotto ? " · lotto " + lotto : "") + queued(ok)); vIn();
   });
 }
 
@@ -288,8 +448,8 @@ function vOut() {
     if (outTipo === "RETTIFICA" && !nota) throw new Error("Scrivi il motivo nella nota.");
     const lotto = normLot(($("oLotNew") && $("oLotNew").value) || ($("oLot") && $("oLot").value) || "");
     if (hasLot(sel) && !lotto) throw new Error("Scegli il lotto.");
-    S = await api("move", { tipo: outTipo, articoloId: id, quantita: q, nota, lotto });
-    outArt = id; toast((outTipo === "SCARICO" ? "Uscita registrata" : "Correzione registrata") + (lotto ? " · lotto " + lotto : "")); vOut();
+    const ok = await submitMove({ tipo: outTipo, articoloId: id, quantita: q, nota, lotto });
+    outArt = id; toast((outTipo === "SCARICO" ? "Uscita " : "Correzione ") + (ok ? "registrata" : "salvata sul telefono") + (lotto ? " · lotto " + lotto : "") + queued(ok)); vOut();
   });
 }
 
@@ -297,7 +457,7 @@ function movRows(list) {
   return list.map(m => {
     const d = new Date(m.data), when = isNaN(d) ? esc(m.data) : d.toLocaleString("it-IT", { day:"2-digit", month:"2-digit", year:"2-digit", hour:"2-digit", minute:"2-digit" });
     const tl = { CARICO:"entrata", SCARICO:"uscita", RETTIFICA:"correzione" }[m.tipo] || m.tipo.toLowerCase();
-    return `<div class="row"><div><div class="t">${esc(m.articolo)}</div><div class="s">${when} · ${esc(tl)} · ${esc(m.utente)}${m.lotto ? " · lotto " + esc(m.lotto) : ""}${m.nota ? " · " + esc(m.nota) : ""}</div></div>
+    return `<div class="row"><div><div class="t">${esc(m.articolo)}${m.pending ? '<span class="badge wait">da inviare</span>' : ""}</div><div class="s">${when} · ${esc(tl)} · ${esc(m.utente)}${m.lotto ? " · lotto " + esc(m.lotto) : ""}${m.nota ? " · " + esc(m.nota) : ""}</div></div>
     <div class="qty ${m.variazione >= 0 ? "pos" : "neg"}">${m.variazione > 0 ? "+" : ""}${fmt(m.variazione)}</div></div>`;
   }).join("");
 }
@@ -317,8 +477,8 @@ function vStock() {
     const q = stockQ.toLowerCase();
     const as = sortL(list.filter(a => groupOf(a) === stockTab && label(a).toLowerCase().includes(q)));
     const low = as.filter(isLowA).length;
-    $("sList").innerHTML = (low ? `<div class="hint low"><b>${low}</b> ${low === 1 ? "articolo è" : "articoli sono"} sotto la soglia minima.</div>` : "") +
-      (as.length ? `<div class="card" style="margin-top:12px">` + as.map(a => `<div class="row" data-id="${esc(a.id)}"><div><div class="t">${esc(a.nome)}${isLowA(a) ? '<span class="badge">scorta bassa</span>' : ""}</div>${a.formato ? `<div class="s">${esc(a.formato)}${hasLot(a) && lotsOf(a).length ? " · " + (lotsOf(a).length === 1 ? "lotto " + esc(lotsOf(a)[0][0]) : lotsOf(a).length + " lotti") : ""}</div>` : ""}</div>
+    $("sList").innerHTML = (low ? `<div class="hint low"><b>${low}</b> ${low === 1 ? "articolo è" : "articoli sono"} sotto la soglia minima o da controllare.</div>` : "") +
+      (as.length ? `<div class="card" style="margin-top:12px">` + as.map(a => `<div class="row" data-id="${esc(a.id)}"><div><div class="t">${esc(a.nome)}${a.giacenza < 0 ? '<span class="badge">negativa: da controllare</span>' : isLowA(a) ? '<span class="badge">scorta bassa</span>' : ""}</div>${a.formato ? `<div class="s">${esc(a.formato)}${hasLot(a) && lotsOf(a).length ? " · " + (lotsOf(a).length === 1 ? "lotto " + esc(lotsOf(a)[0][0]) : lotsOf(a).length + " lotti") : ""}</div>` : ""}</div>
       <div class="qty ${isLowA(a) ? "low" : ""}">${fmt(a.giacenza)} <small>${esc(a.unita)}</small></div></div>`).join("") + "</div>"
       : `<div class="center">${q ? "Nessun articolo trovato." : "Nessun articolo in questa sezione."}</div>`);
     bindRows();
@@ -397,17 +557,18 @@ function vArt() {
     if (!isFinite(q) || q <= 0) throw new Error("Scrivi una quantità valida.");
     const lotto = $("aLot") ? normLot($("aLot").value) : "";
     if ($("aLot") && !lotto) throw new Error("Scrivi il lotto.");
-    S = await api("move", { tipo, articoloId: a.id, quantita: q, nota: $("aNota").value.trim(), lotto });
-    toast((tipo === "CARICO" ? "Entrata registrata: +" : "Uscita registrata: −") + fmt(q) + (lotto ? " · lotto " + lotto : "")); vArt();
+    const ok = await submitMove({ tipo, articoloId: a.id, quantita: q, nota: $("aNota").value.trim(), lotto });
+    toast((tipo === "CARICO" ? "Entrata" : "Uscita") + (ok ? " registrata: " : " salvata sul telefono: ") + (tipo === "CARICO" ? "+" : "−") + fmt(q) + (lotto ? " · lotto " + lotto : "") + queued(ok)); vArt();
   });
   if ($("aIn")) { $("aIn").onclick = () => quick("CARICO"); $("aOut").onclick = () => quick("SCARICO"); }
   $("aSave").onclick = () => run(async () => {
     const article = { id: a.id, categoria: a.categoria, nome: tidy($("aNome").value), formato: forms ? $("aFor").value : a.formato,
       unita: forms ? (/^fusto/i.test($("aFor").value) ? "fusti" : "bt") : $("aUni").value, soglia: num($("aSog").value) || 0, attivo: $("aAtt").value === "1" };
     if (!article.nome) throw new Error("Scrivi il nome.");
+    if (queue.length) throw new Error("Prima devono partire i movimenti in attesa: riprova quando c'è rete.");
     const dup = S.articles.find(x => x.id !== a.id && artKey(x.nome, x.formato) === artKey(article.nome, article.formato));
     if (dup && article.attivo) throw new Error("Esiste già: " + label(dup) + ". Se sono lo stesso articolo usa \"Unisci\".");
-    S = await api("saveArticle", { article });
+    setBase(await api("saveArticle", { article }));
     toast("Salvato"); vArt();
   });
   if ($("aMergeBtn")) {
@@ -416,16 +577,29 @@ function vArt() {
     $("aMergeBtn").onclick = () => run(async () => {
       const t = S.articles.find(x => x.id === $("aMerge").value);
       if (!t) throw new Error("Scegli con quale articolo unirlo.");
+      if (queue.length) throw new Error("Prima devono partire i movimenti in attesa: riprova quando c'è rete.");
       if (armed !== t.id) { armed = t.id; $("aMergeBtn").textContent = `Conferma: sposta ${fmt(a.giacenza)} ${a.unita} su ${label(t)}`; return; }
       const parts = hasLot(a) ? lotsOf(a) : (a.giacenza !== 0 ? [["", a.giacenza]] : []);
       for (const [lotto, q] of parts) {
-        S = await api("move", { tipo: "RETTIFICA", articoloId: a.id, quantita: -q, nota: "Unito in " + label(t), lotto });
-        S = await api("move", { tipo: "RETTIFICA", articoloId: t.id, quantita: q, nota: "Unito da " + label(a), lotto });
+        setBase(await api("move", { tipo: "RETTIFICA", articoloId: a.id, quantita: -q, nota: "Unito in " + label(t), lotto, uid: uid(), quando: new Date().toISOString() }));
+        setBase(await api("move", { tipo: "RETTIFICA", articoloId: t.id, quantita: q, nota: "Unito da " + label(a), lotto, uid: uid(), quando: new Date().toISOString() }));
       }
-      S = await api("saveArticle", { article: { id: a.id, categoria: a.categoria, nome: a.nome, formato: a.formato, unita: a.unita, soglia: a.soglia, attivo: false } });
+      setBase(await api("saveArticle", { article: { id: a.id, categoria: a.categoria, nome: a.nome, formato: a.formato, unita: a.unita, soglia: a.soglia, attivo: false } }));
       editId = t.id; toast("Articoli uniti"); vArt();
     });
   }
+}
+
+/* ---------- MOVIMENTI NON ACCETTATI ---------- */
+function vRej() {
+  if (!rejected.length) { view = "in"; return render(); }
+  $("main").innerHTML = `
+  <div class="hint" style="margin-top:0">Questi movimenti erano stati salvati sul telefono, ma all'invio lo script non li ha accettati. <b>Non sono nell'inventario</b>: controlla e, se serve, registrali di nuovo.</div>
+  <div class="card" style="margin-top:12px">${rejected.map(r => `<div class="row"><div><div class="t">${esc(r.articolo || "Articolo")}</div>
+    <div class="s">${esc(new Date(r.quando).toLocaleString("it-IT", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" }))} · ${esc(({ CARICO:"entrata", SCARICO:"uscita", RETTIFICA:"correzione", ARTICOLO:"nuovo articolo" })[r.tipo] || r.tipo)}${r.quantita != null ? " " + fmt(r.quantita) : ""}${r.lotto ? " · lotto " + esc(r.lotto) : ""}${r.nota ? " · " + esc(r.nota) : ""}</div>
+    <div class="s low">Motivo: ${esc(r.errore)}</div></div></div>`).join("")}</div>
+  <button class="btn sec" id="rOk">Ho controllato, togli l'avviso</button>`;
+  $("rOk").onclick = () => { rejected = []; ls.set(RKEY, null); syncBar(); view = "in"; render(); };
 }
 
 /* ---------- ESPORTAZIONE ---------- */
@@ -456,13 +630,20 @@ async function start() {
   $("activate").classList.add("hide");
   API_URL = "https://script.google.com/macros/s/" + k + "/exec";
   if (!token) return showLogin();
-  try { S = await api("state"); showApp(); }
+  if (base) { derive(); showApp(); refresh(true); return; }   // si parte dai dati salvati sul telefono, poi si aggiorna
+  try { setBase(await api("state")); lastRefresh = Date.now(); showApp(); }
   catch (e) {
     if (!token) return;
     toast(e.message, true); $("login").classList.add("hide"); $("app").classList.remove("hide");
-    $("main").innerHTML = '<div class="center">Impossibile caricare i dati.<br><br><button class="btn sec" onclick="location.reload()">Riprova</button></div>';
+    $("main").innerHTML = '<div class="center">Impossibile caricare i dati.<br>La prima apertura richiede la rete.<br><br><button class="btn sec" onclick="location.reload()">Riprova</button></div>';
   }
 }
+
+window.addEventListener("online", () => refresh(true));
+window.addEventListener("offline", syncBar);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
+setInterval(() => { if (queue.length) flush(); }, 20000);
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 
 start();
 </script>
